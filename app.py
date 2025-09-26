@@ -21,10 +21,9 @@ import streamlit as st
 # =========================
 st.set_page_config(page_title="模擬考與題庫練習", layout="wide", page_icon="📘")
 REPO_ROOT = Path(__file__).resolve().parent
-LOCAL_BANK_ROOT = REPO_ROOT / "題庫"   # 本機預設題庫資料夾（相對於 repo）
+LOCAL_BANK_ROOT = REPO_ROOT / "題庫"   # 本機預設題庫資料夾
 random.seed(42)
 
-# ---- 兼容 rerun API ----
 def _rerun():
     if hasattr(st, "experimental_rerun"):
         st.experimental_rerun()  # type: ignore[attr-defined]
@@ -59,62 +58,47 @@ for k in ["LLM_PROVIDER", "GEMINI_API_KEY", "GEMINI_MODEL"]:
 def gh_enabled() -> bool:
     return all([GH_TOKEN, GH_OWNER, GH_REPO, GH_BRANCH, GH_FOLDER])
 
-# 若偵測到 GH_*，避免誤回本機模式
 if gh_enabled():
     os.environ.pop("BANK_ROOT", None)
 
 # =========================
-# Gemini：模型名淨化 + 404 回退
+# Gemini：模型名淨化 + 2.5→1.5 回退
 # =========================
 def sanitize_gemini_model(name: str) -> str:
-    """
-    將各種形式的名稱（models/xxx, :latest, -001/-002）淨化成正式名。
-    預設使用 gemini-2.5-flash；若不在白名單就回到 2.5-flash。
-    """
     n = (name or "").strip()
     if not n:
         return "gemini-2.5-flash"
-
     n = n.replace("models/", "")
     n = re.sub(r":.*$", "", n)      # :latest
-    n = re.sub(r"-\d+$", "", n)     # -001 / -002
-
-    allow = {
-        "gemini-2.5-flash",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro",
-    }
+    n = re.sub(r"-\d+$", "", n)     # -001/-002
+    allow = {"gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"}
     return n if n in allow else "gemini-2.5-flash"
 
 @st.cache_data(show_spinner=False)
 def llm_explain_cached(prompt: str, provider: str, model: str) -> str:
-    """以 Gemini 產生詳解；2.5 失敗時自動退回 1.5，並安全抽取文字。"""
+    """用 Gemini 產生詳解；2.5 失敗自動退回 1.5。安全抽文字、提高輸出上限。"""
     try:
         if provider.lower() != "gemini":
             return "（AI詳解失敗：未支援的 LLM_PROVIDER）"
 
         import google.generativeai as genai
-        from google.generativeai.types import HarmCategory, HarmBlockThreshold
 
         api_key = os.getenv("GEMINI_API_KEY", "")
         if not api_key:
             return "（AI詳解失敗：GEMINI_API_KEY 未設定）"
         genai.configure(api_key=api_key)
 
-        # 預設使用 2.5，並淨化名稱
         model = sanitize_gemini_model(model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
 
-        # --- 安全抽取文字 ---
         def _extract_text(resp) -> str:
-            # 1) 快速通道：可能會因為沒有 Part 而丟例外
+            # 1) 先嘗試 resp.text
             try:
                 t = getattr(resp, "text", None)
                 if t:
                     return t
             except Exception:
                 pass
-
-            # 2) 從 candidates 裡找 parts[].text
+            # 2) 從 candidates.parts 抽
             try:
                 if getattr(resp, "candidates", None):
                     chunks = []
@@ -128,45 +112,25 @@ def llm_explain_cached(prompt: str, provider: str, model: str) -> str:
                                     chunks.append(txt)
                     if chunks:
                         return "\n".join(chunks)
-                    # 沒有文本就回傳 finish_reason
                     fr = getattr(resp.candidates[0], "finish_reason", "unknown")
                     return f"（AI暫無輸出；finish_reason={fr}）"
             except Exception:
                 pass
-
             return "（AI暫無輸出）"
 
-        # --- 生成器設定：增加輸出上限，必要時放寬安全門檻 ---
         gen_cfg = {
             "temperature": 0.2,
-            "max_output_tokens": 768,  # 調大，避免 finish_reason=MAX_TOKENS(2) 一字未出
+            "max_output_tokens": 768,  # 提高上限，避免 0 字輸出
             "candidate_count": 1,
         }
-        # 視需要放寬（可移除或調整門檻）
-        safety_settings = [
-            {"category": HarmCategory.HARM_CATEGORY_HARASSMENT,
-             "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
-            {"category": HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-             "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
-            {"category": HarmCategory.HARM_CATEGORY_SEXUAL_CONTENT,
-             "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
-            {"category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-             "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
-        ]
 
         def _gen(m: str, p: str):
             g = genai.GenerativeModel(m)
-            return g.generate_content(
-                p,
-                generation_config=gen_cfg,
-                safety_settings=safety_settings,
-            )
+            return g.generate_content(p, generation_config=gen_cfg)  # 不傳 safety_settings，避免 SDK 差異
 
-        # 先試 2.5
         try:
             resp = _gen(model, prompt)
         except Exception as e:
-            # 2.5 沒權限/未開通 → 回退 1.5
             if "was not found" in str(e) or "404" in str(e):
                 resp = _gen("gemini-1.5-flash", prompt)
             else:
@@ -444,12 +408,11 @@ def sidebar_source_and_admin():
         st.sidebar.info("本機模式不提供上傳 GitHub。")
 
 # =========================
-# 側邊：選擇領域/檔案/分頁
+# 側邊：選擇領域/檔案/分頁（無預設）
 # =========================
 def sidebar_pick_domain_files_sheets() -> Tuple[str, List[str], Dict[str, List[str]], bool]:
     st.sidebar.header("領域選擇")
 
-    # 取得可用領域
     if gh_enabled():
         roots = gh_list_dir(GH_FOLDER or "題庫")
         domains = [d["name"] for d in roots if d.get("type") == "dir"]
@@ -459,33 +422,27 @@ def sidebar_pick_domain_files_sheets() -> Tuple[str, List[str], Dict[str, List[s
             return "", [], {}, False
         domains = sorted([p.name for p in LOCAL_BANK_ROOT.iterdir() if p.is_dir()])
 
-    # 不預設任何領域
     PLACEHOLDER = "— 請選擇領域 —"
     domain_sel = st.sidebar.selectbox("選擇領域", options=[PLACEHOLDER] + domains, index=0)
     domain = "" if domain_sel == PLACEHOLDER else domain_sel
     st.session_state.domain = domain
 
-    # 尚未選擇領域就先停在這裡
     if not domain:
         st.sidebar.header("檔案選擇")
         st.sidebar.caption("請先選擇領域後，再挑選檔案與分頁。")
         use_sheet_as_tag = st.sidebar.checkbox("沒有 Tag 的題目，用分頁名作為 Tag", value=True)
         return "", [], {}, use_sheet_as_tag
 
-    # 已選領域 → 顯示檔案清單
     st.sidebar.header("檔案選擇")
     if gh_enabled():
         files_json = gh_list_dir(f"{GH_FOLDER}/{domain}")
-        excel_files = [f["name"] for f in files_json
-                       if f.get("type") == "file" and f["name"].lower().endswith((".xlsx", ".xls"))]
+        excel_files = [f["name"] for f in files_json if f.get("type") == "file" and f["name"].lower().endswith((".xlsx", ".xls"))]
     else:
         p = LOCAL_BANK_ROOT / domain
         excel_files = sorted([x.name for x in p.glob("*.xls*")])
 
-    # 檔案不預設勾選
     picked_files = st.sidebar.multiselect("選擇一個或多個 Excel 檔", options=excel_files, default=[])
 
-    # 只有在有選檔案時才顯示分頁選擇；分頁也不預設勾選（不選＝全部）
     st.sidebar.header("分頁選擇")
     sheet_map: Dict[str, List[str]] = {}
     for fname in picked_files:
@@ -496,19 +453,13 @@ def sidebar_pick_domain_files_sheets() -> Tuple[str, List[str], Dict[str, List[s
                 b = (LOCAL_BANK_ROOT / domain / fname).read_bytes()
             xf = pd.ExcelFile(io.BytesIO(b), engine=("xlrd" if fname.endswith(".xls") else None))
             sheets = xf.sheet_names
-            sel = st.sidebar.multiselect(
-                Path(fname).stem,
-                options=sheets,
-                default=[],                   # <—— 不預設勾選（不選＝全部）
-                help="不選＝載入此檔案的所有分頁"
-            )
-            sheet_map[fname] = sel if sel else None  # None 代表 read_excel_bytes 以全部分頁處理
+            sel = st.sidebar.multiselect(Path(fname).stem, options=sheets, default=[], help="不選＝載入此檔案所有分頁")
+            sheet_map[fname] = sel if sel else None
         except Exception as e:
             st.sidebar.warning(f"{fname} 讀取分頁失敗：{e}")
 
     use_sheet_as_tag = st.sidebar.checkbox("沒有 Tag 的題目，用分頁名作為 Tag", value=True)
     return domain, picked_files, sheet_map, use_sheet_as_tag
-
 
 # =========================
 # 顯示題目 & Prompt
@@ -554,16 +505,30 @@ def show_question(qidx: int, df: pd.DataFrame, mode: str, state_key_prefix: str 
 
     order = [k for k in ["A","B","C","D"] if k in options]
     key = f"{state_key_prefix}_{qid}"
+
+    # 若已作答，預先帶回 radio 的選項
+    saved = st.session_state.get(key)
+    if not saved:
+        # 也從 answers 字典回帶（練習/模擬共用）
+        saved = st.session_state.get("answers", {}).get(qid, {}).get("picked")
+        if saved:
+            st.session_state[key] = saved
+
     picked = st.radio("選擇答案", options=order, format_func=lambda k: f"{k}. {options[k]}", index=None, key=key)
 
-    # 練習模式即時回饋
+    # 練習模式即時回饋 + 顯示正解與正解文字
     if mode == "練習" and picked:
+        # 記錄到 answers（讓返回上一題維持選擇）
+        st.session_state.setdefault("answers", {})
+        st.session_state["answers"][qid] = {"picked": picked}
+
+        correct_text = options.get(answer, "") if answer else ""
         if answer and picked == answer:
-            st.success(f"✅ 正確！答案：{picked}")
+            st.success(f"✅ 正確！答案：{picked}（{correct_text}）")
         elif answer:
-            st.error(f"❌ 錯誤，正解：{answer}")
+            st.error(f"❌ 錯誤，正解：{answer}（{correct_text}）")
         else:
-            st.info("此題題庫未標示正解，僅記錄作答。")
+            st.info("此題題庫未標示正解。")
 
         builtin_exp = str(row.get("explain") or "").strip()
         if builtin_exp:
@@ -583,13 +548,9 @@ def show_question(qidx: int, df: pd.DataFrame, mode: str, state_key_prefix: str 
 def main():
     st.markdown("## 📘 模擬考與題庫練習")
 
-    # 側邊：來源/管理
     sidebar_source_and_admin()
-
-    # 側邊：選擇資料
     domain, files, sheet_map, use_sheet_tag = sidebar_pick_domain_files_sheets()
 
-    # 側邊：出題設定
     st.sidebar.header("出題設定")
     mode = st.sidebar.radio("模式", options=["練習", "模擬"], index=0)
 
@@ -602,10 +563,10 @@ def main():
     }, ensure_ascii=False, sort_keys=True)
 
     n_default = 30
-    n_pick = st.sidebar.number_input("題數", min_value=1, max_value=500, value=5 if mode=="模擬" else n_default, step=1)
+    n_pick = st.sidebar.number_input("題數", min_value=1, max_value=500,
+                                     value=5 if mode=="模擬" else n_default, step=1)
     do_shuffle = st.sidebar.checkbox("亂序顯示", value=True)
 
-    # 若任何條件改變 → 重置開始狀態
     if st.session_state.get("__plan_key__") != plan_key:
         st.session_state.__plan_key__ = plan_key
         st.session_state.started = False
@@ -615,7 +576,6 @@ def main():
         st.session_state.paper_ids = []
         st.session_state.result_df = None
 
-    # 顯示供應者/模型（資訊）
     provider = os.getenv("LLM_PROVIDER", "gemini")
     model_shown = sanitize_gemini_model(os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
     st.caption(f"偵測供應者：**{provider}** / 模型：**{model_shown}**")
@@ -632,7 +592,9 @@ def main():
             all_tags = sorted([t for t in df_bank["tag"].astype(str).unique() if str(t).strip() != ""])
             st.session_state.__all_tags__ = all_tags
 
-            picked_tags = st.sidebar.multiselect("選擇章節/標籤（可多選；不選＝全部）", options=all_tags, default=[])
+            # 全部或篩選：在開始後才顯示已載入的 tags 供用戶選
+            picked_tags = st.sidebar.multiselect("選擇章節/標籤（可多選；不選＝全部）",
+                                                 options=all_tags, default=[])
 
             if picked_tags:
                 df_use = df_bank[df_bank["tag"].isin(picked_tags)].reset_index(drop=True)
@@ -692,15 +654,23 @@ def main():
         qid = row["id"]
         question = row["question"]
         options: Dict[str, str] = row["options"]
+        answer = row.get("answer")
+        correct_text = options.get(answer, "") if answer else ""
 
         st.subheader(f"第 {i+1}/{len(df_use)} 題（模擬考）")
         st.write(question)
         order = [k for k in ["A","B","C","D"] if k in options]
 
         key = f"exam_{qid}"
+        # 預帶使用者先前作答
+        saved = st.session_state.get("answers", {}).get(qid, {}).get("picked")
+        if saved:
+            st.session_state[key] = saved
+
         picked = st.radio("選擇答案", options=order, format_func=lambda k: f"{k}. {options[k]}", index=None, key=key)
         if picked:
-            st.session_state.answers[qid] = {"picked": picked}
+            st.session_state.setdefault("answers", {})
+            st.session_state["answers"][qid] = {"picked": picked}
 
         nav = st.columns([1,1,1,1])
         with nav[0]:
@@ -737,6 +707,7 @@ def main():
                         "OptionC": opt.get("C",""),
                         "OptionD": opt.get("D",""),
                         "Answer": ans or "",
+                        "CorrectText": opt.get(ans, "") if ans else "",
                         "YourAnswer": picked or "",
                         "Result": "" if result is None else ("O" if result else "X"),
                         "Builtin_Explanation": builtin,
@@ -757,7 +728,6 @@ def main():
                 st.session_state.submitted = False
                 _rerun()
 
-        # 只有交卷後才顯示成績與表格
         if st.session_state.get("submitted", False):
             score = st.session_state.get("score", 0)
             total = st.session_state.get("total", len(df_use))
@@ -765,7 +735,7 @@ def main():
 
             out_df = st.session_state.get("result_df")
             if out_df is not None:
-                st.dataframe(out_df, use_container_width=True, height=400)
+                st.dataframe(out_df, use_container_width=True, height=420)
                 csv = out_df.to_csv(index=False).encode("utf-8-sig")
                 st.download_button("下載作答結果（CSV）", data=csv, file_name="exam_result.csv", mime="text/csv")
 
@@ -775,7 +745,7 @@ def main():
                     st.markdown("### 錯題與 AI 詳解")
                     for _, rr in wrong_df.iterrows():
                         with st.expander(f"題目：{rr['Question'][:50]}..."):
-                            st.write(f"正解：{rr['Answer'] or '（未標）'} | 你的答案：{rr['YourAnswer'] or '（未作答）'}")
+                            st.write(f"正解：{rr['Answer'] or '（未標）'}（{rr['CorrectText']}） | 你的答案：{rr['YourAnswer'] or '（未作答）'}")
                             if rr["Builtin_Explanation"]:
                                 st.markdown("**題庫詳解：**")
                                 st.write(rr["Builtin_Explanation"])

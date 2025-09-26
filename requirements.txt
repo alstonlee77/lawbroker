@@ -3,4 +3,4 @@ pandas
 openpyxl
 xlrd<2.0
 requests
-google-generativeai>=0.8.0
+google-generativeai>=0.8.3

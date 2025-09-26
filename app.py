@@ -88,39 +88,92 @@ def sanitize_gemini_model(name: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def llm_explain_cached(prompt: str, provider: str, model: str) -> str:
-    """
-    以 Gemini 產生詳解；若 2.5 無權限/404，自動退回 1.5-flash。
-    """
+    """以 Gemini 產生詳解；2.5 失敗時自動退回 1.5，並安全抽取文字。"""
     try:
-        if provider.lower() == "gemini":
-            import google.generativeai as genai  # google-generativeai>=0.8.0
-            api_key = os.getenv("GEMINI_API_KEY", "")
-            if not api_key:
-                return "（AI詳解失敗：GEMINI_API_KEY 未設定）"
-            genai.configure(api_key=api_key)
-            model = sanitize_gemini_model(model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
-
-            def _gen(m: str, p: str):
-                g = genai.GenerativeModel(m)
-                return g.generate_content(
-                    p,
-                    generation_config={"temperature": 0.2, "max_output_tokens": 400},
-                )
-
-            try:
-                resp = _gen(model, prompt)
-            except Exception as e:
-                # 2.5 沒權限或找不到 → 退回 1.5
-                if "was not found" in str(e) or "404" in str(e):
-                    try:
-                        resp = _gen("gemini-1.5-flash", prompt)
-                    except Exception as e2:
-                        raise e2
-                else:
-                    raise
-            return (getattr(resp, "text", "") or "").strip()
-        else:
+        if provider.lower() != "gemini":
             return "（AI詳解失敗：未支援的 LLM_PROVIDER）"
+
+        import google.generativeai as genai
+        from google.generativeai.types import HarmCategory, HarmBlockThreshold
+
+        api_key = os.getenv("GEMINI_API_KEY", "")
+        if not api_key:
+            return "（AI詳解失敗：GEMINI_API_KEY 未設定）"
+        genai.configure(api_key=api_key)
+
+        # 預設使用 2.5，並淨化名稱
+        model = sanitize_gemini_model(model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
+
+        # --- 安全抽取文字 ---
+        def _extract_text(resp) -> str:
+            # 1) 快速通道：可能會因為沒有 Part 而丟例外
+            try:
+                t = getattr(resp, "text", None)
+                if t:
+                    return t
+            except Exception:
+                pass
+
+            # 2) 從 candidates 裡找 parts[].text
+            try:
+                if getattr(resp, "candidates", None):
+                    chunks = []
+                    for c in resp.candidates:
+                        content = getattr(c, "content", None)
+                        parts = getattr(content, "parts", None) if content else None
+                        if parts:
+                            for p in parts:
+                                txt = getattr(p, "text", None)
+                                if txt:
+                                    chunks.append(txt)
+                    if chunks:
+                        return "\n".join(chunks)
+                    # 沒有文本就回傳 finish_reason
+                    fr = getattr(resp.candidates[0], "finish_reason", "unknown")
+                    return f"（AI暫無輸出；finish_reason={fr}）"
+            except Exception:
+                pass
+
+            return "（AI暫無輸出）"
+
+        # --- 生成器設定：增加輸出上限，必要時放寬安全門檻 ---
+        gen_cfg = {
+            "temperature": 0.2,
+            "max_output_tokens": 768,  # 調大，避免 finish_reason=MAX_TOKENS(2) 一字未出
+            "candidate_count": 1,
+        }
+        # 視需要放寬（可移除或調整門檻）
+        safety_settings = [
+            {"category": HarmCategory.HARM_CATEGORY_HARASSMENT,
+             "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
+            {"category": HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+             "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
+            {"category": HarmCategory.HARM_CATEGORY_SEXUAL_CONTENT,
+             "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
+            {"category": HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+             "threshold": HarmBlockThreshold.BLOCK_ONLY_HIGH},
+        ]
+
+        def _gen(m: str, p: str):
+            g = genai.GenerativeModel(m)
+            return g.generate_content(
+                p,
+                generation_config=gen_cfg,
+                safety_settings=safety_settings,
+            )
+
+        # 先試 2.5
+        try:
+            resp = _gen(model, prompt)
+        except Exception as e:
+            # 2.5 沒權限/未開通 → 回退 1.5
+            if "was not found" in str(e) or "404" in str(e):
+                resp = _gen("gemini-1.5-flash", prompt)
+            else:
+                raise
+
+        return _extract_text(resp).strip()
+
     except Exception as e:
         return f"（AI詳解失敗：{e}）"
 

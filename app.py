@@ -67,12 +67,12 @@ if gh_enabled():
 def sanitize_gemini_model(name: str) -> str:
     n = (name or "").strip()
     if not n:
-        return "gemini-1.5-flash"
+        return "gemini-2.5-flash"
     n = n.replace("models/", "")
     n = re.sub(r":.*$", "", n)      # 去掉 :latest
     n = re.sub(r"-\d+$", "", n)     # 去掉 -001/-002
-    allow = {"gemini-1.5-flash", "gemini-1.5-pro"}
-    return n if n in allow else "gemini-1.5-flash"
+    allow = {"gemini-2.5-flash", "gemini-2.5-pro"}
+    return n if n in allow else "gemini-2.5-flash"
 
 
 @st.cache_data(show_spinner=False)
@@ -84,7 +84,7 @@ def llm_explain_cached(prompt: str, provider: str, model: str) -> str:
             if not api_key:
                 return "（AI詳解失敗：GEMINI_API_KEY 未設定）"
             genai.configure(api_key=api_key)
-            model = sanitize_gemini_model(model or os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+            model = sanitize_gemini_model(model or os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
 
             def _gen(m: str, p: str):
                 g = genai.GenerativeModel(m)
@@ -98,7 +98,7 @@ def llm_explain_cached(prompt: str, provider: str, model: str) -> str:
             except Exception as e:
                 # 404 / not found 之類 → 回退到 flash
                 if "was not found" in str(e) or "404" in str(e):
-                    resp = _gen("gemini-1.5-flash", prompt)
+                    resp = _gen("gemini-2.5-flash", prompt)
                 else:
                     raise
             return (getattr(resp, "text", "") or "").strip()
@@ -482,7 +482,7 @@ def show_question(qidx: int, df: pd.DataFrame, mode: str, state_key_prefix: str 
                 st.write(builtin_exp)
         else:
             provider = os.getenv("LLM_PROVIDER", "gemini")
-            model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+            model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
             prompt = make_explain_prompt(question, options, answer, picked)
             ai_text = llm_explain_cached(prompt, provider, model)
             with st.expander("AI 詳解", expanded=True):
@@ -560,7 +560,7 @@ def main():
 
     # 顯示 LLM 狀態（除錯）
     provider = os.getenv("LLM_PROVIDER", "gemini")
-    model_shown = sanitize_gemini_model(os.getenv("GEMINI_MODEL", "gemini-1.5-flash"))
+    model_shown = sanitize_gemini_model(os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
     st.caption(f"偵測供應者：**{provider}** / 模型：**{model_shown}**")
 
     # 狀態初始化

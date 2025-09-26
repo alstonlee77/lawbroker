@@ -7,13 +7,13 @@ import os
 import re
 import json
 import base64
-import random
 import textwrap
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import requests
 import pandas as pd
+import requests
 import streamlit as st
 
 # =========================
@@ -24,9 +24,15 @@ REPO_ROOT = Path(__file__).resolve().parent
 LOCAL_BANK_ROOT = REPO_ROOT / "題庫"   # 本機預設題庫資料夾（相對於 repo）
 random.seed(42)
 
+# ---- 兼容 rerun API ----
+def _rerun():
+    if hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()  # type: ignore[attr-defined]
+    else:
+        st.rerun()
 
 # =========================
-# 工具：讀 Secrets / Env
+# Secrets / Env
 # =========================
 def _get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     try:
@@ -34,8 +40,7 @@ def _get_secret(key: str, default: Optional[str] = None) -> Optional[str]:
     except Exception:
         return default
 
-
-# GitHub 參數（若有就走 GitHub 模式）
+# GitHub（若有就啟用雲端題庫）
 GH_TOKEN  = _get_secret("GH_TOKEN",  os.getenv("GH_TOKEN"))
 GH_OWNER  = _get_secret("GH_OWNER",  os.getenv("GH_OWNER"))
 GH_REPO   = _get_secret("GH_REPO",   os.getenv("GH_REPO"))
@@ -45,41 +50,50 @@ GH_FOLDER = _get_secret("GH_FOLDER", os.getenv("GH_FOLDER", "題庫"))
 # Admin 密碼
 ADMIN_PASSWORD = _get_secret("ADMIN_PASSWORD", os.getenv("ADMIN_PASSWORD", ""))
 
-# LLM 參數（Gemini）
+# LLM（Gemini）
 for k in ["LLM_PROVIDER", "GEMINI_API_KEY", "GEMINI_MODEL"]:
     v = _get_secret(k, os.getenv(k))
     if v:
         os.environ[k] = str(v)
 
-
 def gh_enabled() -> bool:
     return all([GH_TOKEN, GH_OWNER, GH_REPO, GH_BRANCH, GH_FOLDER])
 
-
-# 一旦偵測到 GH_*，強制忽略任何本機 BANK_ROOT 類型設定，避免 /Users/... 殘留
+# 若偵測到 GH_*，避免誤回本機模式
 if gh_enabled():
     os.environ.pop("BANK_ROOT", None)
-
 
 # =========================
 # Gemini：模型名淨化 + 404 回退
 # =========================
 def sanitize_gemini_model(name: str) -> str:
+    """
+    將各種形式的名稱（models/xxx, :latest, -001/-002）淨化成正式名。
+    預設使用 gemini-2.5-flash；若不在白名單就回到 2.5-flash。
+    """
     n = (name or "").strip()
     if not n:
         return "gemini-2.5-flash"
-    n = n.replace("models/", "")
-    n = re.sub(r":.*$", "", n)      # 去掉 :latest
-    n = re.sub(r"-\d+$", "", n)     # 去掉 -001/-002
-    allow = {"gemini-2.5-flash", "gemini-2.5-pro"}
-    return n if n in allow else "gemini-2.5-flash"
 
+    n = n.replace("models/", "")
+    n = re.sub(r":.*$", "", n)      # :latest
+    n = re.sub(r"-\d+$", "", n)     # -001 / -002
+
+    allow = {
+        "gemini-2.5-flash",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+    }
+    return n if n in allow else "gemini-2.5-flash"
 
 @st.cache_data(show_spinner=False)
 def llm_explain_cached(prompt: str, provider: str, model: str) -> str:
+    """
+    以 Gemini 產生詳解；若 2.5 無權限/404，自動退回 1.5-flash。
+    """
     try:
         if provider.lower() == "gemini":
-            import google.generativeai as genai  # 需 requirements: google-generativeai>=0.8.0
+            import google.generativeai as genai  # google-generativeai>=0.8.0
             api_key = os.getenv("GEMINI_API_KEY", "")
             if not api_key:
                 return "（AI詳解失敗：GEMINI_API_KEY 未設定）"
@@ -96,9 +110,12 @@ def llm_explain_cached(prompt: str, provider: str, model: str) -> str:
             try:
                 resp = _gen(model, prompt)
             except Exception as e:
-                # 404 / not found 之類 → 回退到 flash
+                # 2.5 沒權限或找不到 → 退回 1.5
                 if "was not found" in str(e) or "404" in str(e):
-                    resp = _gen("gemini-2.5-flash", prompt)
+                    try:
+                        resp = _gen("gemini-1.5-flash", prompt)
+                    except Exception as e2:
+                        raise e2
                 else:
                     raise
             return (getattr(resp, "text", "") or "").strip()
@@ -107,9 +124,8 @@ def llm_explain_cached(prompt: str, provider: str, model: str) -> str:
     except Exception as e:
         return f"（AI詳解失敗：{e}）"
 
-
 # =========================
-# GitHub API：讀檔/寫檔
+# GitHub API
 # =========================
 def gh_headers() -> Dict[str, str]:
     return {
@@ -118,7 +134,6 @@ def gh_headers() -> Dict[str, str]:
     }
 
 def gh_list_dir(path: str) -> List[Dict]:
-    """列出 GH_FOLDER/path 的內容（目錄/檔案）"""
     url = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/contents/{path}?ref={GH_BRANCH}"
     r = requests.get(url, headers=gh_headers(), timeout=30)
     if r.status_code != 200:
@@ -126,7 +141,6 @@ def gh_list_dir(path: str) -> List[Dict]:
     return r.json()
 
 def gh_read_file(path: str) -> bytes:
-    """讀 GH repo 中的檔案（自動處理 large file download_url）"""
     url = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/contents/{path}?ref={GH_BRANCH}"
     r = requests.get(url, headers=gh_headers(), timeout=60)
     if r.status_code != 200:
@@ -134,7 +148,6 @@ def gh_read_file(path: str) -> bytes:
     data = r.json()
     if "content" in data and data.get("encoding") == "base64":
         return base64.b64decode(data["content"])
-    # 大檔 → 用 download_url
     download_url = data.get("download_url")
     if not download_url:
         raise RuntimeError(f"GitHub 無 download_url：{path}")
@@ -150,7 +163,6 @@ def gh_get_file_sha(path: str) -> Optional[str]:
     return None
 
 def gh_write_file(path: str, content: bytes, message: str) -> bool:
-    """建立/更新檔案到 GitHub（需 PAT 有 repo contents:write）"""
     url = f"https://api.github.com/repos/{GH_OWNER}/{GH_REPO}/contents/{path}"
     sha = gh_get_file_sha(path)
     payload = {
@@ -163,9 +175,8 @@ def gh_write_file(path: str, content: bytes, message: str) -> bool:
     r = requests.put(url, headers=gh_headers(), data=json.dumps(payload), timeout=60)
     return 200 <= r.status_code < 300
 
-
 # =========================
-# 資料載入與正規化
+# 欄位對應 / 題庫讀取
 # =========================
 OPTION_ALIASES = {
     "A": ["A", "OptionA", "選項A", "選項一", "選項1", "答案選項1", "選項甲"],
@@ -184,7 +195,6 @@ def find_first_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
     for n in names:
         if n in cols:
             return cols[n]
-    # 寬鬆搜尋：忽略空白
     low = {re.sub(r"\s+", "", c.lower()): c for c in df.columns.astype(str)}
     for n in names:
         key = re.sub(r"\s+", "", n.lower())
@@ -193,7 +203,6 @@ def find_first_col(df: pd.DataFrame, names: List[str]) -> Optional[str]:
     return None
 
 def normalize_row(row: pd.Series, sheet_tag: Optional[str]) -> Optional[Dict]:
-    # 問題
     qcol = find_first_col(row.to_frame().T, QUESTION_ALIASES)
     if not qcol:
         return None
@@ -201,7 +210,6 @@ def normalize_row(row: pd.Series, sheet_tag: Optional[str]) -> Optional[Dict]:
     if not question:
         return None
 
-    # 選項
     options = {}
     for k, aliases in OPTION_ALIASES.items():
         for a in aliases:
@@ -210,11 +218,9 @@ def normalize_row(row: pd.Series, sheet_tag: Optional[str]) -> Optional[Dict]:
                 if val and val.lower() not in ["nan", "none"]:
                     options[k] = val
                     break
-    # 至少需要兩個選項
     if len(options) < 2:
         return None
 
-    # 答案
     ans_col = find_first_col(row.to_frame().T, ANSWER_ALIASES)
     answer_raw = str(row[ans_col]).strip() if ans_col else ""
     answer = None
@@ -231,36 +237,31 @@ def normalize_row(row: pd.Series, sheet_tag: Optional[str]) -> Optional[Dict]:
         elif up in ["4", "④", "4️⃣"]:
             answer = "D"
         else:
-            # 若答案填的是選項文字 → 轉成對應 A/B/C/D
             for k, v in options.items():
                 if v == answer_raw:
                     answer = k
                     break
 
-    # Tag
     tag_col = find_first_col(row.to_frame().T, TAG_ALIASES)
     tag = str(row[tag_col]).strip() if (tag_col and str(row[tag_col]).strip()) else (sheet_tag or "")
 
-    # ID
     id_col = find_first_col(row.to_frame().T, ID_ALIASES)
     rid = str(row[id_col]).strip() if id_col else ""
 
-    # 詳解（若題庫本身有）
     exp_col = find_first_col(row.to_frame().T, EXPLAIN_ALIASES)
     expl = str(row[exp_col]).strip() if exp_col else ""
 
     return {
         "id": rid,
         "question": question,
-        "options": options,   # dict: {"A": "...", "B": "..."}
-        "answer": answer,     # 可能為 None → 視為題庫未標答案
+        "options": options,
+        "answer": answer,
         "tag": tag,
         "explain": expl,
     }
 
 def read_excel_bytes(xls_bytes: bytes, filename: str, selected_sheets: Optional[List[str]]) -> List[Dict]:
     buf = io.BytesIO(xls_bytes)
-    # 自動選 engine（.xls -> xlrd）
     engine = "xlrd" if filename.lower().endswith(".xls") else None
     xf = pd.ExcelFile(buf, engine=engine)
     sheets = selected_sheets or xf.sheet_names
@@ -270,24 +271,19 @@ def read_excel_bytes(xls_bytes: bytes, filename: str, selected_sheets: Optional[
             df = xf.parse(s)
         except Exception:
             continue
-        sheet_tag = s  # 可當預設 Tag
-        # 將每列轉為標準題目結構
-        for _, r in df.iterrows():
+        sheet_tag = s
+        for idx, r in df.iterrows():
             item = normalize_row(r, sheet_tag=sheet_tag)
             if item:
-                # 填入來源資訊（方便回溯）
                 item["source_file"] = filename
                 item["source_sheet"] = s
-                # 若缺 ID，用「檔名_分頁_流水號」
                 if not item["id"]:
-                    item["id"] = f"{Path(filename).stem}:{s}:{_}"
+                    item["id"] = f"{Path(filename).stem}:{s}:{idx}"
                 results.append(item)
     return results
 
-
 @st.cache_data(show_spinner=True)
 def load_bank_from_github(domain: str, files: List[str], sheet_map: Dict[str, List[str]]) -> List[Dict]:
-    """files 是該 domain 底下的檔名清單（不含路徑）"""
     all_items: List[Dict] = []
     for fname in files:
         rel = f"{GH_FOLDER}/{domain}/{fname}"
@@ -316,103 +312,6 @@ def load_bank_from_local(domain: str, files: List[str], sheet_map: Dict[str, Lis
             st.warning(f"讀取 {p} 失敗：{e}")
     return all_items
 
-
-# =========================
-# UI：側邊欄
-# =========================
-def sidebar_source_and_admin():
-    st.sidebar.header("資料來源與管理")
-    if gh_enabled():
-        src_text = f"來源模式：**GitHub / {GH_FOLDER}**"
-    else:
-        src_text = f"來源模式：**本機 / {LOCAL_BANK_ROOT.name}**"
-    st.sidebar.caption(src_text)
-
-    # 管理模式切換
-    if "is_admin" not in st.session_state:
-        st.session_state.is_admin = False
-    if st.sidebar.button("啟用管理模式" if not st.session_state.is_admin else "關閉管理模式", use_container_width=True):
-        if not st.session_state.is_admin:
-            if ADMIN_PASSWORD:
-                pw = st.sidebar.text_input("輸入管理密碼", type="password", key="__admin_pw__", value="", placeholder="Admin password", label_visibility="collapsed")
-                st.stop()
-            else:
-                st.session_state.is_admin = True
-                st.rerun()
-        else:
-            st.session_state.is_admin = False
-            st.rerun()
-
-    if st.session_state.is_admin:
-        st.sidebar.success("管理模式已啟用")
-        if gh_enabled():
-            st.sidebar.markdown("**上傳 Excel 到 GitHub**")
-            domain = st.session_state.get("domain") or ""
-            up = st.sidebar.file_uploader("選擇 Excel 檔（上傳後會 commit 到目前領域資料夾）", type=["xlsx", "xls"], accept_multiple_files=False)
-            if up and domain:
-                content = up.read()
-                path = f"{GH_FOLDER}/{domain}/{up.name}"
-                ok = gh_write_file(path, content, message=f"upload {up.name} to {domain}")
-                if ok:
-                    st.sidebar.success(f"已更新：{path}")
-                    st.cache_data.clear()
-                else:
-                    st.sidebar.error("上傳失敗，請檢查 GH_TOKEN 權限（需 contents:write）")
-        else:
-            st.sidebar.info("本機模式不提供上傳 GitHub。")
-
-
-def sidebar_pick_domain_files_sheets() -> Tuple[str, List[str], Dict[str, List[str]], bool]:
-    st.sidebar.header("領域選擇")
-
-    if gh_enabled():
-        # 列出 GH_FOLDER 下的子資料夾
-        roots = gh_list_dir(GH_FOLDER or "題庫")
-        domains = [d["name"] for d in roots if d.get("type") == "dir"]
-    else:
-        if not LOCAL_BANK_ROOT.exists():
-            st.sidebar.error(f"找不到根目錄：{LOCAL_BANK_ROOT}")
-            return "", [], {}, False
-        domains = sorted([p.name for p in LOCAL_BANK_ROOT.iterdir() if p.is_dir()])
-
-    domain = st.sidebar.selectbox("選擇領域", options=domains or ["（無資料夾）"], index=0)
-    st.session_state.domain = domain
-
-    # 檔案選擇
-    st.sidebar.header("檔案選擇")
-    if gh_enabled():
-        files_json = gh_list_dir(f"{GH_FOLDER}/{domain}")
-        excel_files = [f["name"] for f in files_json if f.get("type") == "file" and f["name"].lower().endswith((".xlsx", ".xls"))]
-    else:
-        p = LOCAL_BANK_ROOT / domain
-        excel_files = sorted([x.name for x in p.glob("*.xls*")])
-
-    picked_files = st.sidebar.multiselect("選擇一個或多個 Excel 檔", options=excel_files, default=excel_files[:1])
-
-    # 分頁選擇（逐檔）
-    st.sidebar.header("分頁選擇")
-    sheet_map: Dict[str, List[str]] = {}
-    for fname in picked_files:
-        try:
-            if gh_enabled():
-                b = gh_read_file(f"{GH_FOLDER}/{domain}/{fname}")
-            else:
-                b = (LOCAL_BANK_ROOT / domain / fname).read_bytes()
-            xf = pd.ExcelFile(io.BytesIO(b), engine=("xlrd" if fname.endswith(".xls") else None))
-            sheets = xf.sheet_names
-            sel = st.sidebar.multiselect(f"{Path(fname).stem}", options=sheets, default=sheets, key=f"__sheets__{fname}")
-            sheet_map[fname] = sel
-        except Exception as e:
-            st.sidebar.warning(f"{fname} 讀取分頁失敗：{e}")
-
-    use_sheet_as_tag = st.sidebar.checkbox("沒有 Tag 的題目，用分頁名作為 Tag", value=True)
-
-    return domain, picked_files, sheet_map, use_sheet_as_tag
-
-
-# =========================
-# 題庫載入 + 過濾
-# =========================
 def assemble_bank(domain: str, files: List[str], sheet_map: Dict[str, List[str]], use_sheet_tag: bool) -> pd.DataFrame:
     if not domain or not files:
         return pd.DataFrame()
@@ -436,62 +335,112 @@ def assemble_bank(domain: str, files: List[str], sheet_map: Dict[str, List[str]]
     else:
         df["tag"] = df.get("tag", "").fillna("").astype(str)
 
-    # 只留至少兩個選項的題目
     df = df[df["options"].apply(lambda d: isinstance(d, dict) and len(d) >= 2)]
     df = df.reset_index(drop=True)
     return df
 
+# =========================
+# 側邊：管理與來源
+# =========================
+def sidebar_source_and_admin():
+    st.sidebar.header("資料來源與管理")
+    if gh_enabled():
+        st.sidebar.caption(f"來源模式：**GitHub / {GH_FOLDER}**")
+    else:
+        st.sidebar.caption(f"來源模式：**本機 / {LOCAL_BANK_ROOT.name}**")
+
+    if "is_admin" not in st.session_state:
+        st.session_state.is_admin = False
+
+    if not st.session_state.is_admin:
+        if st.sidebar.button("啟用管理模式", use_container_width=True):
+            if ADMIN_PASSWORD:
+                st.session_state.__await_pw__ = True
+            else:
+                st.session_state.is_admin = True
+            _rerun()
+    else:
+        if st.sidebar.button("關閉管理模式", use_container_width=True):
+            st.session_state.is_admin = False
+            _rerun()
+
+    if st.session_state.get("__await_pw__", False):
+        pw = st.sidebar.text_input("輸入管理密碼", type="password")
+        if st.sidebar.button("登入"):
+            if pw == ADMIN_PASSWORD:
+                st.session_state.is_admin = True
+                st.session_state.__await_pw__ = False
+                _rerun()
+            else:
+                st.sidebar.error("密碼錯誤。")
+
+    if st.session_state.is_admin and gh_enabled():
+        st.sidebar.success("管理模式已啟用（GitHub）")
+        domain = st.session_state.get("domain") or ""
+        up = st.sidebar.file_uploader("上傳 Excel 到目前領域", type=["xlsx", "xls"])
+        if up and domain:
+            content = up.read()
+            path = f"{GH_FOLDER}/{domain}/{up.name}"
+            ok = gh_write_file(path, content, f"upload {up.name} to {domain}")
+            if ok:
+                st.sidebar.success(f"已更新：{path}")
+                st.cache_data.clear()
+            else:
+                st.sidebar.error("上傳失敗，請檢查 Token 權限（contents:write）。")
+    elif st.session_state.is_admin:
+        st.sidebar.info("本機模式不提供上傳 GitHub。")
 
 # =========================
-# 出題 UI 與流程
+# 側邊：選擇領域/檔案/分頁
 # =========================
-def show_question(qidx: int, df: pd.DataFrame, mode: str, state_key_prefix: str = "q") -> None:
-    row = df.iloc[qidx]
-    qid = row["id"]
-    options: Dict[str, str] = row["options"]
-    answer = row.get("answer")
-    question = row["question"]
-    tag = row.get("tag", "")
+def sidebar_pick_domain_files_sheets() -> Tuple[str, List[str], Dict[str, List[str]], bool]:
+    st.sidebar.header("領域選擇")
+    if gh_enabled():
+        roots = gh_list_dir(GH_FOLDER or "題庫")
+        domains = [d["name"] for d in roots if d.get("type") == "dir"]
+    else:
+        if not LOCAL_BANK_ROOT.exists():
+            st.sidebar.error(f"找不到根目錄：{LOCAL_BANK_ROOT}")
+            return "", [], {}, False
+        domains = sorted([p.name for p in LOCAL_BANK_ROOT.iterdir() if p.is_dir()])
 
-    st.subheader(f"第 {qidx+1}/{len(df)} 題")
-    st.markdown(f"**{question}**")
-    if tag:
-        st.caption(f"Tag：{tag}")
+    domain = st.sidebar.selectbox("選擇領域", options=domains or ["（無）"])
+    st.session_state.domain = domain
 
-    # 選項以固定順序 A-D 顯示（只顯示存在的）
-    order = [k for k in ["A","B","C","D"] if k in options]
-    labels = [f"{k}. {options[k]}" for k in order]
+    st.sidebar.header("檔案選擇")
+    if gh_enabled():
+        files_json = gh_list_dir(f"{GH_FOLDER}/{domain}")
+        excel_files = [f["name"] for f in files_json if f.get("type") == "file" and f["name"].lower().endswith((".xlsx", ".xls"))]
+    else:
+        p = LOCAL_BANK_ROOT / domain
+        excel_files = sorted([x.name for x in p.glob("*.xls*")])
 
-    # 使用 qid 保持作答狀態
-    key = f"{state_key_prefix}_{qid}"
-    picked = st.radio("選擇答案", options=order, format_func=lambda k: f"{k}. {options[k]}", index=None, key=key)
+    picked_files = st.sidebar.multiselect("選擇一個或多個 Excel 檔", options=excel_files, default=excel_files[:1])
 
-    # 練習模式：即時給判斷與詳解
-    if mode == "練習" and picked:
-        if answer and picked == answer:
-            st.success(f"✅ 正確！答案：{picked}")
-        elif answer:
-            st.error(f"❌ 錯誤，正解：{answer}")
-        else:
-            st.info("此題題庫未標示正解，僅記錄作答。")
+    st.sidebar.header("分頁選擇")
+    sheet_map: Dict[str, List[str]] = {}
+    for fname in picked_files:
+        try:
+            if gh_enabled():
+                b = gh_read_file(f"{GH_FOLDER}/{domain}/{fname}")
+            else:
+                b = (LOCAL_BANK_ROOT / domain / fname).read_bytes()
+            xf = pd.ExcelFile(io.BytesIO(b), engine=("xlrd" if fname.endswith(".xls") else None))
+            sheets = xf.sheet_names
+            sel = st.sidebar.multiselect(Path(fname).stem, options=sheets, default=sheets, key=f"__sheets__{fname}")
+            sheet_map[fname] = sel
+        except Exception as e:
+            st.sidebar.warning(f"{fname} 讀取分頁失敗：{e}")
 
-        # 顯示題庫已有詳解，否則用 LLM
-        builtin_exp = str(row.get("explain") or "").strip()
-        if builtin_exp:
-            with st.expander("題庫詳解", expanded=True):
-                st.write(builtin_exp)
-        else:
-            provider = os.getenv("LLM_PROVIDER", "gemini")
-            model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-            prompt = make_explain_prompt(question, options, answer, picked)
-            ai_text = llm_explain_cached(prompt, provider, model)
-            with st.expander("AI 詳解", expanded=True):
-                st.write(ai_text)
+    use_sheet_as_tag = st.sidebar.checkbox("沒有 Tag 的題目，用分頁名作為 Tag", value=True)
+    return domain, picked_files, sheet_map, use_sheet_as_tag
 
-
+# =========================
+# 顯示題目 & Prompt
+# =========================
 def make_explain_prompt(question: str, options: Dict[str, str], answer: Optional[str], picked: Optional[str]) -> str:
     opt_text = "\n".join([f"{k}. {v}" for k, v in options.items()])
-    ans_text = answer if answer else "（題庫未標答案，請依專業判斷後給出最可能的正解）"
+    ans_text = answer if answer else "（題庫未標答案，請依專業判斷後給出最可能正解）"
     picked_text = picked or "（尚未作答）"
     prompt = f"""
 你是一位保險/金融考題的專業出題與解析老師。請用繁體中文，針對這題出「精簡但清楚」的解析，條列要點與關鍵概念、避免贅詞。
@@ -515,6 +464,43 @@ def make_explain_prompt(question: str, options: Dict[str, str], answer: Optional
 """
     return textwrap.dedent(prompt).strip()
 
+def show_question(qidx: int, df: pd.DataFrame, mode: str, state_key_prefix: str = "q") -> None:
+    row = df.iloc[qidx]
+    qid = row["id"]
+    options: Dict[str, str] = row["options"]
+    answer = row.get("answer")
+    question = row["question"]
+    tag = row.get("tag", "")
+
+    st.subheader(f"第 {qidx+1}/{len(df)} 題")
+    if tag:
+        st.caption(f"Tag：{tag}")
+    st.markdown(f"**{question}**")
+
+    order = [k for k in ["A","B","C","D"] if k in options]
+    key = f"{state_key_prefix}_{qid}"
+    picked = st.radio("選擇答案", options=order, format_func=lambda k: f"{k}. {options[k]}", index=None, key=key)
+
+    # 練習模式即時回饋
+    if mode == "練習" and picked:
+        if answer and picked == answer:
+            st.success(f"✅ 正確！答案：{picked}")
+        elif answer:
+            st.error(f"❌ 錯誤，正解：{answer}")
+        else:
+            st.info("此題題庫未標示正解，僅記錄作答。")
+
+        builtin_exp = str(row.get("explain") or "").strip()
+        if builtin_exp:
+            with st.expander("題庫詳解", expanded=True):
+                st.write(builtin_exp)
+        else:
+            provider = os.getenv("LLM_PROVIDER", "gemini")
+            model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+            prompt = make_explain_prompt(question, options, answer, picked)
+            ai_text = llm_explain_cached(prompt, provider, model)
+            with st.expander("AI 詳解", expanded=True):
+                st.write(ai_text)
 
 # =========================
 # 主程式
@@ -522,79 +508,111 @@ def make_explain_prompt(question: str, options: Dict[str, str], answer: Optional
 def main():
     st.markdown("## 📘 模擬考與題庫練習")
 
-    # 來源 / 管理
+    # 側邊：來源/管理
     sidebar_source_and_admin()
 
-    # 選擇領域/檔案/分頁
+    # 側邊：選擇資料
     domain, files, sheet_map, use_sheet_tag = sidebar_pick_domain_files_sheets()
 
-    # 出題設定
+    # 側邊：出題設定
     st.sidebar.header("出題設定")
-    mode = st.sidebar.radio("模式", options=["練習", "模擬"], index=0, horizontal=True)
-    # 載入題庫
-    df_bank = assemble_bank(domain, files, sheet_map, use_sheet_tag)
+    mode = st.sidebar.radio("模式", options=["練習", "模擬"], index=0)
 
-    if df_bank.empty:
-        st.info("請先在左側選擇領域 → 檔案 → 分頁。")
-        return
+    plan_key = json.dumps({
+        "domain": domain,
+        "files": files,
+        "sheets": sheet_map,
+        "use_sheet_tag": use_sheet_tag,
+        "mode": mode,
+    }, ensure_ascii=False, sort_keys=True)
 
-    st.success(f"已載入題目數：{len(df_bank)}")
+    n_default = 30
+    n_pick = st.sidebar.number_input("題數", min_value=1, max_value=500, value=5 if mode=="模擬" else n_default, step=1)
+    do_shuffle = st.sidebar.checkbox("亂序顯示", value=True)
 
-    # Tag 過濾
-    all_tags = sorted([t for t in df_bank["tag"].astype(str).unique() if str(t).strip() != ""])
-    picked_tags = st.sidebar.multiselect("選擇章節/標籤（可多選；不選＝全部）", options=all_tags, default=[])
-    if picked_tags:
-        df_use = df_bank[df_bank["tag"].isin(picked_tags)].reset_index(drop=True)
-    else:
-        df_use = df_bank
+    # 若任何條件改變 → 重置開始狀態
+    if st.session_state.get("__plan_key__") != plan_key:
+        st.session_state.__plan_key__ = plan_key
+        st.session_state.started = False
+        st.session_state.submitted = False
+        st.session_state.cur_idx = 0
+        st.session_state.answers = {}
+        st.session_state.paper_ids = []
+        st.session_state.result_df = None
 
-    # 題數與亂序
-    default_n = min(30, len(df_use))
-    n_questions = st.sidebar.number_input("題數", min_value=1, max_value=len(df_use), value=default_n, step=1)
-    shuffle = st.sidebar.checkbox("亂序顯示", value=True)
-
-    # 抽題
-    if shuffle:
-        df_use = df_use.sample(frac=1.0, random_state=None).reset_index(drop=True)
-    df_use = df_use.iloc[:n_questions].reset_index(drop=True)
-
-    # 顯示 LLM 狀態（除錯）
+    # 顯示供應者/模型（資訊）
     provider = os.getenv("LLM_PROVIDER", "gemini")
     model_shown = sanitize_gemini_model(os.getenv("GEMINI_MODEL", "gemini-2.5-flash"))
     st.caption(f"偵測供應者：**{provider}** / 模型：**{model_shown}**")
 
-    # 狀態初始化
-    if "cur_idx" not in st.session_state:
-        st.session_state.cur_idx = 0
-    if "answers" not in st.session_state:
-        st.session_state.answers = {}  # qid -> {"picked": "A"}
-    if "paper_ids" not in st.session_state:
-        st.session_state.paper_ids = list(df_use["id"])  # 用於模擬考的固定題序
+    # ======= 尚未開始：顯示「開始出題」 =======
+    if not st.session_state.get("started", False):
+        st.info("請先在左側完成選擇，然後按下「開始出題」。")
+        if st.button("🚀 開始出題", type="primary", use_container_width=True):
+            df_bank = assemble_bank(domain, files, sheet_map, use_sheet_tag)
+            if df_bank.empty:
+                st.error("載入題庫失敗或為空，請確認選擇。")
+                return
 
-    # 重新對齊題序（切換設定後）
-    st.session_state.paper_ids = list(df_use["id"])
+            all_tags = sorted([t for t in df_bank["tag"].astype(str).unique() if str(t).strip() != ""])
+            st.session_state.__all_tags__ = all_tags
 
-    # 主要畫面
+            picked_tags = st.sidebar.multiselect("選擇章節/標籤（可多選；不選＝全部）", options=all_tags, default=[])
+
+            if picked_tags:
+                df_use = df_bank[df_bank["tag"].isin(picked_tags)].reset_index(drop=True)
+            else:
+                df_use = df_bank
+
+            if do_shuffle:
+                df_use = df_use.sample(frac=1.0, random_state=None).reset_index(drop=True)
+            df_use = df_use.iloc[:min(n_pick, len(df_use))].reset_index(drop=True)
+
+            if df_use.empty:
+                st.error("過濾後沒有題目，請調整條件。")
+                return
+
+            st.session_state.paper_df = df_use
+            st.session_state.paper_ids = list(df_use["id"])
+            st.session_state.cur_idx = 0
+            st.session_state.answers = {}
+            st.session_state.submitted = False
+            st.session_state.started = True
+            _rerun()
+        return
+
+    # ======= 已開始：題目流程 =======
+    df_use: pd.DataFrame = st.session_state.get("paper_df", pd.DataFrame())
+    if df_use.empty:
+        st.warning("目前沒有題目，請重新按「開始出題」。")
+        st.session_state.started = False
+        return
+
+    st.success(f"本次抽題數：{len(df_use)}")
+    if "__all_tags__" in st.session_state and st.session_state.__all_tags__:
+        st.caption("可用標籤（資訊）： " + "、".join(st.session_state.__all_tags__))
+
+    i = st.session_state.get("cur_idx", 0)
+    i = max(0, min(i, len(df_use)-1))
+    st.session_state.cur_idx = i
+
     if mode == "練習":
-        i = st.session_state.cur_idx
         show_question(i, df_use, mode="練習", state_key_prefix="prac")
 
-        cols = st.columns(3)
-        with cols[0]:
+        nav = st.columns([1,1,1,1])
+        with nav[0]:
             if st.button("⬅️ 上一題", use_container_width=True, disabled=(i == 0)):
-                st.session_state.cur_idx = max(0, i - 1)
-                st.rerun()
-        with cols[1]:
-            if st.button("🔄 重新整理本題", use_container_width=True):
-                st.rerun()
-        with cols[2]:
+                st.session_state.cur_idx = max(0, i-1); _rerun()
+        with nav[1]:
+            if st.button("🔄 重新抽題", use_container_width=True):
+                st.session_state.started = False; _rerun()
+        with nav[2]:
             if st.button("➡️ 下一題", use_container_width=True, disabled=(i >= len(df_use)-1)):
-                st.session_state.cur_idx = min(len(df_use)-1, i + 1)
-                st.rerun()
+                st.session_state.cur_idx = min(len(df_use)-1, i+1); _rerun()
+        with nav[3]:
+            pass
 
     else:  # 模擬考
-        # 作答紀錄
-        i = st.session_state.cur_idx
         row = df_use.iloc[i]
         qid = row["id"]
         question = row["question"]
@@ -609,18 +627,15 @@ def main():
         if picked:
             st.session_state.answers[qid] = {"picked": picked}
 
-        cols = st.columns(3)
-        with cols[0]:
+        nav = st.columns([1,1,1,1])
+        with nav[0]:
             if st.button("⬅️ 上一題", use_container_width=True, disabled=(i == 0)):
-                st.session_state.cur_idx = max(0, i - 1)
-                st.rerun()
-        with cols[1]:
+                st.session_state.cur_idx = max(0, i-1); _rerun()
+        with nav[1]:
             if st.button("➡️ 下一題", use_container_width=True, disabled=(i >= len(df_use)-1)):
-                st.session_state.cur_idx = min(len(df_use)-1, i + 1)
-                st.rerun()
-        with cols[2]:
-            if st.button("🧾 交卷", type="primary", use_container_width=True):
-                # 計分
+                st.session_state.cur_idx = min(len(df_use)-1, i+1); _rerun()
+        with nav[2]:
+            if st.button("🧾 交卷", type="primary", use_container_width=True, disabled=st.session_state.get("submitted", False)):
                 score = 0
                 rows = []
                 for _, r in df_use.iterrows():
@@ -632,7 +647,6 @@ def main():
                     if result:
                         score += 1
 
-                    # AI 詳解（僅錯題或未標正解）
                     builtin = str(r.get("explain") or "").strip()
                     ai_text = ""
                     if not builtin:
@@ -657,16 +671,29 @@ def main():
                     })
 
                 total = len(df_use)
-                st.success(f"成績：{score}/{total}（{round(score*100/total,1)} 分）")
+                st.session_state.submitted = True
+                st.session_state.score = score
+                st.session_state.total = total
+                st.session_state.result_df = pd.DataFrame(rows)
+                _rerun()
+        with nav[3]:
+            if st.button("🔁 重新開始", use_container_width=True):
+                st.session_state.started = False
+                st.session_state.submitted = False
+                _rerun()
 
-                out_df = pd.DataFrame(rows)
+        # 只有交卷後才顯示成績與表格
+        if st.session_state.get("submitted", False):
+            score = st.session_state.get("score", 0)
+            total = st.session_state.get("total", len(df_use))
+            st.success(f"成績：{score}/{total}（{round(score*100/total,1)} 分）")
+
+            out_df = st.session_state.get("result_df")
+            if out_df is not None:
                 st.dataframe(out_df, use_container_width=True, height=400)
-
-                # 下載 CSV
                 csv = out_df.to_csv(index=False).encode("utf-8-sig")
                 st.download_button("下載作答結果（CSV）", data=csv, file_name="exam_result.csv", mime="text/csv")
 
-                # 顯示 AI 詳解（僅錯題/未標正解才有）
                 wrong_df = out_df[(out_df["Result"] == "X") | (out_df["Result"] == "")]
                 if not wrong_df.empty:
                     st.markdown("---")
@@ -682,8 +709,7 @@ def main():
                                 st.write(rr["AI_Explanation"])
 
     st.markdown("---")
-    st.caption("若看到 /Users/... 找不到，請確認已切換到 GitHub 模式並移除 BANK_ROOT；或把題庫放在 repo 的『題庫/』內。")
-
+    st.caption("若顯示 /Users/... 找不到表示在本機模式；要用 GitHub 題庫請設定 GH_* 並確保題庫在 repo 的『題庫/』資料夾中。")
 
 if __name__ == "__main__":
     main()

@@ -426,12 +426,17 @@ def assemble_bank(domain: str, files: List[str], sheet_map: Dict[str, List[str]]
         return pd.DataFrame()
 
     df = pd.DataFrame(items)
-    if use_sheet_tag:
-        df["tag"] = df["tag"].fillna("").replace("", df["source_sheet"])
-    else:
-        df["tag"] = df["tag"].fillna("")
 
-    # 只留有兩個以上選項的題目
+    if use_sheet_tag:
+        df["tag"] = df.get("tag", "").astype(str)
+        df["source_sheet"] = df.get("source_sheet", "").astype(str)
+        df["tag"] = df["tag"].replace({"nan": ""})
+        mask = df["tag"].isna() | (df["tag"].str.strip() == "")
+        df.loc[mask, "tag"] = df.loc[mask, "source_sheet"]
+    else:
+        df["tag"] = df.get("tag", "").fillna("").astype(str)
+
+    # 只留至少兩個選項的題目
     df = df[df["options"].apply(lambda d: isinstance(d, dict) and len(d) >= 2)]
     df = df.reset_index(drop=True)
     return df

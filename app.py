@@ -395,6 +395,8 @@ def sidebar_source_and_admin():
 # =========================
 def sidebar_pick_domain_files_sheets() -> Tuple[str, List[str], Dict[str, List[str]], bool]:
     st.sidebar.header("領域選擇")
+
+    # 取得可用領域
     if gh_enabled():
         roots = gh_list_dir(GH_FOLDER or "題庫")
         domains = [d["name"] for d in roots if d.get("type") == "dir"]
@@ -404,19 +406,33 @@ def sidebar_pick_domain_files_sheets() -> Tuple[str, List[str], Dict[str, List[s
             return "", [], {}, False
         domains = sorted([p.name for p in LOCAL_BANK_ROOT.iterdir() if p.is_dir()])
 
-    domain = st.sidebar.selectbox("選擇領域", options=domains or ["（無）"])
+    # 不預設任何領域
+    PLACEHOLDER = "— 請選擇領域 —"
+    domain_sel = st.sidebar.selectbox("選擇領域", options=[PLACEHOLDER] + domains, index=0)
+    domain = "" if domain_sel == PLACEHOLDER else domain_sel
     st.session_state.domain = domain
 
+    # 尚未選擇領域就先停在這裡
+    if not domain:
+        st.sidebar.header("檔案選擇")
+        st.sidebar.caption("請先選擇領域後，再挑選檔案與分頁。")
+        use_sheet_as_tag = st.sidebar.checkbox("沒有 Tag 的題目，用分頁名作為 Tag", value=True)
+        return "", [], {}, use_sheet_as_tag
+
+    # 已選領域 → 顯示檔案清單
     st.sidebar.header("檔案選擇")
     if gh_enabled():
         files_json = gh_list_dir(f"{GH_FOLDER}/{domain}")
-        excel_files = [f["name"] for f in files_json if f.get("type") == "file" and f["name"].lower().endswith((".xlsx", ".xls"))]
+        excel_files = [f["name"] for f in files_json
+                       if f.get("type") == "file" and f["name"].lower().endswith((".xlsx", ".xls"))]
     else:
         p = LOCAL_BANK_ROOT / domain
         excel_files = sorted([x.name for x in p.glob("*.xls*")])
 
-    picked_files = st.sidebar.multiselect("選擇一個或多個 Excel 檔", options=excel_files, default=excel_files[:1])
+    # 檔案不預設勾選
+    picked_files = st.sidebar.multiselect("選擇一個或多個 Excel 檔", options=excel_files, default=[])
 
+    # 只有在有選檔案時才顯示分頁選擇；分頁也不預設勾選（不選＝全部）
     st.sidebar.header("分頁選擇")
     sheet_map: Dict[str, List[str]] = {}
     for fname in picked_files:
@@ -427,13 +443,19 @@ def sidebar_pick_domain_files_sheets() -> Tuple[str, List[str], Dict[str, List[s
                 b = (LOCAL_BANK_ROOT / domain / fname).read_bytes()
             xf = pd.ExcelFile(io.BytesIO(b), engine=("xlrd" if fname.endswith(".xls") else None))
             sheets = xf.sheet_names
-            sel = st.sidebar.multiselect(Path(fname).stem, options=sheets, default=sheets, key=f"__sheets__{fname}")
-            sheet_map[fname] = sel
+            sel = st.sidebar.multiselect(
+                Path(fname).stem,
+                options=sheets,
+                default=[],                   # <—— 不預設勾選（不選＝全部）
+                help="不選＝載入此檔案的所有分頁"
+            )
+            sheet_map[fname] = sel if sel else None  # None 代表 read_excel_bytes 以全部分頁處理
         except Exception as e:
             st.sidebar.warning(f"{fname} 讀取分頁失敗：{e}")
 
     use_sheet_as_tag = st.sidebar.checkbox("沒有 Tag 的題目，用分頁名作為 Tag", value=True)
     return domain, picked_files, sheet_map, use_sheet_as_tag
+
 
 # =========================
 # 顯示題目 & Prompt
